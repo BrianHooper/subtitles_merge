@@ -1,0 +1,466 @@
+#!/usr/bin/python3.6
+
+#########################
+# addsubtitles          #
+# Adds subtitle streams #
+# to video files        #
+#                       #
+# Brian Hooper          #
+# 06/08/19              #
+#########################
+
+from PyQt5.QtWidgets import *
+import os
+from shutil import which
+import sys
+from pathlib import Path
+import subprocess
+from multiprocessing import Process, Pipe
+
+
+def execute_command(command_string, video_path, temp_path):
+    """
+    Executes the command to add the subtitle stream to the video, and removes the temporary file if the conversion
+    is successful
+    :param command_string: text command to run
+    :param video_path: path of video file
+    :param temp_path: path of temporary file
+    :return: None
+    """
+    result = subprocess.run(command_string, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True).stdout.decode(
+        "utf-8")
+    if not os.path.exists(temp_path):
+        return "Error converting file " + video_path.name, result
+    os.remove(video_path)
+    os.rename(temp_path, video_path)
+    return video_path.name + ": SUCCESS", result
+
+
+def add_ffmpeg(video_path, temp_path, subs_path):
+    """
+    Adds subtitles to an mp4 file
+    :param video_path: path to video file
+    :param temp_path: path to temporary file
+    :param subs_path: path to subtitles file
+    :return: None
+    """
+    if which("ffmpeg") is None:
+        return "Error, either program ffmpeg is not installed or it does not exist in PATH"
+
+    command_string = "ffmpeg -i \"" + str(video_path) + "\" -i \"" + str(subs_path) + \
+                     "\" -c copy -c:s mov_text \"" + str(temp_path) + "\""
+
+    return execute_command(command_string, video_path, temp_path)
+
+
+def add_avi(video_path, temp_path, subs_path):
+    """
+    Adds subtitles to an avi file
+    :param video_path: path to video file
+    :param temp_path: path to temporary file
+    :param subs_path: path to subtitles file
+    :return: None
+    """
+    return "Error, .avi files are not currently supported."
+
+
+def add_mkv(video_path, temp_path, subs_path):
+    """
+    Adds subtitles to an mkv file
+    :param video_path: path to video file
+    :param temp_path: path to temporary file
+    :param subs_path: path to subtitles file
+    :return: None
+    """
+    if which("mkvmerge") is None:
+        return "Error, either program mkvmerge is not installed or it does not exist in PATH"
+
+    command_string = "mkvmerge -o \"" + str(temp_path) + "\" \"" + str(video_path) + \
+                     "\" --language \"0:eng\" --track-name \"0:English\" \"" + str(subs_path) + "\""
+
+    return execute_command(command_string, video_path, temp_path)
+
+
+def check_file_exists(file, halt=False):
+    """
+    Halts execution of the program if a file does not exist
+    :param file: path to file
+    :param halt: if true, program will halt on error
+    :return: True if the file exists
+    """
+    if not os.path.exists(file):
+        if halt:
+            stderr("Error: " + str(file.name) + " does not exist", 1)
+        else:
+            return False
+    return True
+
+
+def stderr(error_msg, return_val):
+    """
+    Outputs an error message and halts the program
+    :param error_msg: error message
+    :param return_val: return value to exit program
+    :return: None
+    """
+    print(error_msg, file=sys.stderr)
+    exit(return_val)
+
+
+def add_subtitles(video_path, subs_path):
+    """
+    Adds the subtitle stream to a video file
+    :param video_path: path to video file
+    :param subs_path: path to subtitles file
+    :return: None
+    """
+    video_path = Path(video_path)
+    subs_path = Path(subs_path)
+
+    if not check_file_exists(video_path) or not check_file_exists(subs_path):
+        return "Error: " + video_path.name + " does not exist"
+
+    if video_path.suffix not in supported_file_types.keys() or not subs_path.suffix == '.srt':
+        return "Error: " + video_path.name + " is not a supported video type or subtitle type"
+
+    if not os.access(video_path.parent, os.W_OK):
+        return "Error: no write access to folder " + str(video_path.parent) + ", check permissions"
+
+    temp_path = video_path.parent / ("temp_" + video_path.name)
+    if os.path.exists(temp_path):
+        os.remove(temp_path)
+
+    return supported_file_types[video_path.suffix](video_path, temp_path, subs_path)
+
+
+def read_list_inputs(videos, subtitles):
+    """
+    Reads a list of videos and a list of subtitles, and attempts to add the correct subtitle stream to each
+    :param videos: list of video paths
+    :param subtitles: list of srt paths
+    :return: None
+    """
+    if len(videos) != len(subtitles):
+        stderr("Error: number of video files does not match the number of srt files", 1)
+    for index in range(len(videos)):
+        add_subtitles(videos[index], subtitles[index])
+
+
+def process_videos(videos, subtitles, pipe):
+    """
+    Processes a list of video and subtitle files
+
+    Using a Pipe to pass output back to the GUI allows the interface to draw while background processes
+    are being processed
+    :param videos: List of video files
+    :param subtitles: List of subtitle files
+    :param pipe: Pipe for returning outputs
+    :return: None
+    """
+    return_messages = []
+    for index in range(len(videos)):
+        return_messages.append(add_subtitles(videos[index], subtitles[index]))
+    pipe.send(return_messages)
+    pipe.close()
+
+
+class ListWidget(QListWidget):
+    """
+    Class ListWidget
+
+    Maintains a list of short-form and long-form items that can be manually sorted
+    """
+    def __init__(self):
+        super().__init__()
+        self.items = []
+        self.items_long = []
+        self.update_list()
+
+    def add_item(self, short, long):
+        """
+        Adds a single item to the list
+        :param short: Long form
+        :param long: Short form
+        :return: None
+        """
+        self.items.append(short)
+        self.items_long.append(long)
+
+    def remove_item(self):
+        """
+        Removes the currently selected item from the list
+        :return: The item that was removed
+        """
+        index = self.currentRow()
+        if index == -1 and len(self.items) > 0:
+            index = 0
+        if index < 0 or index >= len(self.items):
+            return
+        item = self.items_long[index]
+        del (self.items[index])
+        del (self.items_long[index])
+        self.update_list()
+        return item
+
+    def move_up(self):
+        """
+        Moves the currently selected item up
+        :return: None
+        """
+        index = self.currentRow()
+        if index < 0 or index >= len(self.items):
+            return
+        if index == 0:
+            other = len(self.items) - 1
+        else:
+            other = index - 1
+        self.items[index], self.items[other] = self.items[other], self.items[index]
+        self.items_long[index], self.items_long[other] = self.items_long[other], self.items_long[index]
+        self.setCurrentRow(other)
+        self.update_list()
+
+    def move_down(self):
+        """
+        Moves the currently selected item down
+        :return: None
+        """
+        index = self.currentRow()
+        if index < 0 or index >= len(self.items):
+            return
+        if index == len(self.items) - 1:
+            other = 0
+        else:
+            other = index + 1
+        self.items[index], self.items[other] = self.items[other], self.items[index]
+        self.items_long[index], self.items_long[other] = self.items_long[other], self.items_long[index]
+        self.setCurrentRow(other)
+        self.update_list()
+
+    def update_list(self):
+        """
+        Updates the list with the current items
+        :return: None
+        """
+        row = self.currentRow()
+        if row == -1:
+            row = 0
+        self.clear()
+        self.addItems(self.items)
+        if len(self.items) > 0:
+            self.setCurrentRow(row)
+        self.update()
+
+
+def process_output(messages, message_list):
+    """
+    Processes a list of output tuples into a message list and a log
+    :param messages: List of output tuples
+    :param message_list: List to add messages to
+    :return: Log string
+    """
+    log = ""
+    for message in messages:
+        if isinstance(message, str):
+            message_list.add_item(message, message)
+        elif isinstance(message, tuple):
+            message_list.add_item(message[0], message[0])
+            log += message[1] + "\n"
+    message_list.update_list()
+    return log
+
+
+class MainPanel(QWidget):
+    """
+    Class MainPanel
+
+    Main panel of GUI
+    """
+    def __init__(self):
+        """
+        Initializes the GUI
+        """
+        super().__init__()
+        self.grid = QGridLayout()
+        self.videos = ListWidget()
+        self.subtitles = ListWidget()
+        self.videos.update_list()
+        self.subtitles.update_list()
+        self.init_ui()
+
+    def init_ui(self):
+        """
+        Initializes the user interface
+        :return: None
+        """
+        self.setLayout(self.grid)
+        self.draw_panel()
+        self.setGeometry(300, 400, 750, 500)
+        self.setWindowTitle("Subtitle Merge")
+
+        self.show()
+
+    def draw_panel(self):
+        """
+        Draws the main panel
+        :return: None
+        """
+        self.grid.addWidget(QLabel("Videos"), 0, 0)
+        self.grid.addWidget(self.videos, 1, 0)
+        self.add_button("Up", self.videos.move_up, 2, 0)
+        self.add_button("Down", self.videos.move_down, 3, 0)
+        self.add_button("Add", self.add_videos, 4, 0)
+        self.add_button("Remove", self.videos.remove_item, 5, 0)
+
+        self.grid.addWidget(QLabel("Subtitles"), 0, 1)
+        self.grid.addWidget(self.subtitles, 1, 1)
+        self.add_button("Up", self.subtitles.move_up, 2, 1)
+        self.add_button("Down", self.subtitles.move_down, 3, 1)
+        self.add_button("Add", self.add_subtitles, 4, 1)
+        self.add_button("Remove", self.subtitles.remove_item, 5, 1)
+
+        self.add_button("Merge subtitles", self.merge, 6, 0, 1, 2)
+
+    def add_button(self, label, connect_function, row, column, row_span=1, col_span=1):
+        """
+        Adds a button to the current grid
+        :param label: label of the button
+        :param connect_function: function to call when the button is pressed
+        :param row: row of the grid to place the button
+        :param column: column of the grid to place the button
+        :param row_span: number of rows to span
+        :param col_span: number of columns to span
+        :return:
+        """
+        button = QPushButton(label)
+        button.clicked.connect(connect_function)
+        self.grid.addWidget(button, row, column, row_span, col_span)
+
+    def add_files(self, files_list, file_types):
+        """
+        Shows a file dialog
+        :param files_list: List to add the files to
+        :param file_types: string representing the types of files supported
+        :return: None
+        """
+        files = self.file_dialog(file_types)
+        if files and len(files) > 0:
+            for file in files:
+                long = Path(file)
+                files_list.add_item(long.name, file)
+            files_list.update_list()
+
+    def add_videos(self):
+        """
+        Shows file dialog for adding video files
+        :return: None
+        """
+        self.add_files(self.videos, "Video files (*.mp4 *.avi *.mkv);;All files (*.*)")
+
+    def add_subtitles(self):
+        """
+        Shows file dialog for adding subtitle files
+        :return: None
+        """
+        self.add_files(self.subtitles, "Subtitle Files (*.srt);;All Files (*)")
+
+    def file_dialog(self, filetypes):
+        """
+        Shows a file open dialog
+        :param filetypes: types of files to allow
+        :return: List of file paths
+        """
+        options = QFileDialog.Options()
+        options |= QFileDialog.DontUseNativeDialog
+        files, _ = QFileDialog.getOpenFileNames(self, "QFileDialog.getOpenFileNames()", "", filetypes, options=options)
+        return files
+
+    def splash(self, videos):
+        """
+        Displays a splash screen while the subtitles are being merged
+        :return:
+        """
+        self.grid.addWidget(QLabel("Merging subtitles:"), 0, 0)
+        video_labels = ListWidget()
+        self.grid.addWidget(video_labels, 1, 0)
+        for index, name in enumerate(videos):
+            video_labels.add_item(name, name)
+        video_labels.update_list()
+
+    def clear(self):
+        """
+        Removes all widgets from the current panel
+        :return: None
+        """
+        for i in reversed(range(self.grid.count())):
+            self.grid.itemAt(i).widget().setParent(None)
+
+    def set_results(self, messages):
+        """
+        Displays the results of the merge
+        :param messages: list of outputs from the merge operation
+        :return: None
+        """
+        message_list = ListWidget()
+        log = process_output(messages, message_list)
+        self.grid.addWidget(QLabel("Results:"), 0, 0)
+        self.grid.addWidget(message_list, 1, 0)
+
+        self.grid.addWidget(QLabel("Detailed output log:"), 2, 0)
+        log_box = QPlainTextEdit(log)
+        self.grid.addWidget(log_box, 3, 0)
+
+        self.add_button("Merge more subtitles", self.return_button, 4, 0)
+
+    def return_button(self):
+        """
+        Resets the panel back to the main frame
+        :return: None
+        """
+        self.clear()
+        self.videos = ListWidget()
+        self.subtitles = ListWidget()
+        self.draw_panel()
+
+    def merge(self):
+        """
+        Checks that the input is valid and merges the files
+        :return: None
+        """
+        videos = self.videos.items_long
+        subtitles = self.subtitles.items_long
+        if len(videos) != len(subtitles):
+            QMessageBox.about(self, "Error", "Number of videos does not match the number of subtitles")
+            return
+        if len(videos) == 0:
+            QMessageBox.about(self, "Error", "Must have at least one video file")
+            return
+
+        self.clear()
+        self.splash(videos)
+
+        qm = QMessageBox()
+        ret = qm.question(self, '', "Are you sure to merge these subtitles? The process may take several minutes",
+                          qm.Yes | qm.No)
+        if ret != qm.Yes:
+            self.clear()
+            self.draw_panel()
+            return
+
+        parent_conn, child_conn = Pipe()
+        p = Process(target=process_videos, args=(videos, subtitles, child_conn,))
+        p.start()
+        return_messages = parent_conn.recv()
+        p.join()
+
+        self.clear()
+        self.set_results(return_messages)
+
+
+# Function references for matching file types with the appropriate application
+supported_file_types = {".mkv": add_mkv, ".mp4": add_ffmpeg, ".avi": add_avi}
+
+if __name__ == '__main__':
+    # Initialize GUI
+    app = QApplication(sys.argv)
+    ex = MainPanel()
+    sys.exit(app.exec_())
